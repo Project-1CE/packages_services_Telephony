@@ -92,6 +92,8 @@ import java.util.regex.Pattern;
 
 import javax.annotation.Nullable;
 
+import org.codeaurora.ims.QtiCallConstants;
+
 /**
  * Service for making GSM and CDMA connections.
  */
@@ -188,6 +190,8 @@ public class TelephonyConnectionService extends ConnectionService {
     private AnswerAndReleaseHandler mAnswerAndReleaseHandler = null;
     /** Handler for hold across sub use case */
     private HoldHandlerBase mHoldHandler = null;
+    /** UNKNOWN original call type for video CRS. */
+    public static final int CALL_TYPE_UNKNOWN = -1;
 
     // Contains one TelephonyConnection that has placed a call and a memory of which Phones it has
     // already tried to connect with. There should be only one TelephonyConnection trying to place a
@@ -574,6 +578,10 @@ public class TelephonyConnectionService extends ConnectionService {
              if (!isConcurrentCallAllowedDuringVideoCall(conn.getPhone())) {
                  return;
              }
+
+            // Update EXTRA_ANSWERING_DROPS_FG_CALL in DSDA mode
+            updateAnsweringDropsFgCallExtra();
+
             /*
              * Either there is no call present on the other SUB or there is
              * a connected Video call on other SUB then no need to check
@@ -1572,13 +1580,14 @@ public class TelephonyConnectionService extends ConnectionService {
         }
 
         /*
-         * Check if the incoming call is a Voice call and there is no Video call on the other
-         * SUB in which case we do not have to do any special handling and let the incoming
-         * call pass as is.
+         * Check if the incoming call is a Voice call w/ or w/o Video CRS and there is
+         * no Video call on the other SUB in which case we do not have to do any special
+         * handling and let the incoming call pass as is.
          */
         boolean hasConnectedVideoCallOnOtherSub =
                 hasConnectedVideoCallOnOtherSub(incomingHandle);
-        if (!VideoProfile.isVideo(incomingConnection.getVideoState()) &&
+        if ((!VideoProfile.isVideo(incomingConnection.getVideoState()) ||
+                isVideoCrsForVoLteCall(incomingConnection)) &&
                 !hasConnectedVideoCallOnOtherSub) {
             return;
         }
@@ -1611,6 +1620,80 @@ public class TelephonyConnectionService extends ConnectionService {
             disableSwap(incomingConnection, true);
         }
     }
+
+    private void updateAnsweringDropsFgCallExtra() {
+        // Check for DSDA mode
+        if (!isConcurrentCallsPossible()) {
+            return;
+        }
+
+        TelephonyConnection ringingConnection = (TelephonyConnection) getRingingConnection();
+        if (ringingConnection == null) {
+            return;
+        }
+
+        Phone ringingPhone = ringingConnection.getPhone();
+        if (ringingPhone == null) {
+            return;
+        }
+
+        PhoneAccountHandle ringingHandle = mPhoneUtilsProxy
+                .makePstnPhoneAccountHandle(ringingPhone);
+        com.android.internal.telephony.Connection ringingOriginalConnection = ringingConnection
+                .getOriginalConnection();
+        // If holding Video call is allowed or ringing connection is null or is not IMS then return
+        if (isVideoCallHoldAllowedOnOtherSub(ringingPhone)
+                || ringingOriginalConnection == null
+                || ringingOriginalConnection.getPhoneType() != PhoneConstants.PHONE_TYPE_IMS) {
+            return;
+        }
+
+        /*
+         * In DSDA mode, if holding Video call is not allowed on the other SUB then active
+         * video call is downgraded or active voice call is upgraded:
+         * 1) If a video call is downgraded to voice call then answering the incoming
+         *    call will not end the call(s) on the other SUB.
+         * 2) If a voice call is upgraded to video call then answering the incoming
+         *    call will end the call(s) on the other SUB.
+         */
+        ImsPhoneConnection imsOriginalConnection = (ImsPhoneConnection) ringingOriginalConnection;
+        boolean hasConnectedVideoCallOnOtherSub = hasConnectedVideoCallOnOtherSub(ringingHandle);
+        if (!hasConnectedVideoCallOnOtherSub &&
+                ringingOriginalConnection.isActiveCallDisconnectedOnAnswer()) {
+            Log.v(this, "updateAnsweringDropsFgCallExtra remove extra in ringing connection");
+            ringingConnection.removeExtras(Connection.EXTRA_ANSWERING_DROPS_FG_CALL);
+        } else if (hasConnectedVideoCallOnOtherSub &&
+                !ringingOriginalConnection.isActiveCallDisconnectedOnAnswer()) {
+            Log.v(this, "updateAnsweringDropsFgCallExtra enable extra in ringing connection");
+            enableAnsweringWillDisconnect(imsOriginalConnection, ringingConnection);
+        }
+    }
+
+    public boolean isVideoCrsForVoLteCall(TelephonyConnection connection) {
+        return getOriginalCallType(connection) == VideoProfile.STATE_AUDIO_ONLY &&
+                isVideoCrsCall(connection);
+    }
+
+    public boolean isVideoCrsCall(TelephonyConnection connection) {
+        Bundle connExtras = connection.getExtras();
+        if (connExtras == null) {
+            return false;
+        }
+        int crsType = connExtras.getInt(QtiCallConstants.EXTRA_CRS_TYPE,
+                QtiCallConstants.CRS_TYPE_INVALID);
+        return (crsType == (QtiCallConstants.CRS_TYPE_VIDEO
+                    | QtiCallConstants.CRS_TYPE_AUDIO));
+    }
+
+    public int getOriginalCallType(TelephonyConnection connection) {
+        Bundle connExtras = connection.getExtras();
+        if (connExtras == null) {
+            return CALL_TYPE_UNKNOWN;
+        }
+        return connExtras.getInt(QtiCallConstants.EXTRA_ORIGINAL_CALL_TYPE,
+                CALL_TYPE_UNKNOWN);
+    }
+
 
     /**
      * Checks to see if there are video calls present on a sub other than the one passed in.
